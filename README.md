@@ -198,7 +198,7 @@ cache ← store ← k8s
 
 ---
 
-## Infraestrutura Kubernetes
+## Infraestrutura Kubernetes (https://github.com/ViniciusClaudomir/k8s)
 
 ### artifact-registry (`k8s/artifact-registry/`)
 
