@@ -18,6 +18,18 @@ import (
 	"controller/internal/store"
 )
 
+// proxyClient com pool de conexões adequado para tráfego concorrente.
+// http.DefaultClient usa MaxIdleConnsPerHost=2, insuficiente para 10+ threads.
+var proxyClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        1000,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true, // resposta já pode estar comprimida pelo upstream
+	},
+	Timeout: 60 * time.Second,
+}
+
 type Handler struct {
 	router  *router.Router
 	store   *store.Store
@@ -26,7 +38,30 @@ type Handler struct {
 }
 
 func New(r *router.Router, s *store.Store, m *metrics.Metrics, w *k8s.Watcher) *Handler {
-	return &Handler{router: r, store: s, metrics: m, watcher: w}
+	h := &Handler{router: r, store: s, metrics: m, watcher: w}
+	// registra callback para pré-aquecer conexões TCP com novos pods
+	w.SetWarmupFunc(h.warmupPods)
+	return h
+}
+
+// warmupPods faz um HEAD /health em cada pod usando o proxyClient,
+// forçando o pool de conexões a manter sockets abertos antes do tráfego real.
+func (h *Handler) warmupPods(podIPs []string) {
+	for _, ip := range podIPs {
+		go func(ip string) {
+			req, err := http.NewRequest(http.MethodHead, "http://"+ip+"/health", nil)
+			if err != nil {
+				return
+			}
+			resp, err := proxyClient.Do(req)
+			if err != nil {
+				log.Printf("[warmup] pod %s indisponível: %v", ip, err)
+				return
+			}
+			resp.Body.Close()
+			log.Printf("[warmup] conexão pré-aquecida com pod %s", ip)
+		}(ip)
+	}
 }
 
 func (h *Handler) Lookup(w http.ResponseWriter, r *http.Request) {
@@ -61,50 +96,63 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	target, _, shouldRecord := h.router.ChooseTarget(r.Context(), operator)
 	h.metrics.IncrementPodRequest(target)
 
+	podIP := strings.TrimPrefix(target, "http://")
+	h.watcher.IncrementInFlight(podIP)
+	defer h.watcher.DecrementInFlight(podIP)
+
 	targetURL := target + r.URL.Path
 
-	body, err := io.ReadAll(r.Body)
+	// passa r.Body diretamente — sem io.ReadAll, sem buffer desnecessário
+	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
 	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-
-	proxyReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
-	if err != nil {
+		log.Printf("[submit][ERROR] operator=%s falha ao montar proxy request para %s: %v", operator, targetURL, err)
 		http.Error(w, "proxy error", http.StatusBadGateway)
 		return
 	}
 	proxyReq.Header = r.Header.Clone()
+	proxyReq.ContentLength = r.ContentLength
 
-	resp, err := http.DefaultClient.Do(proxyReq)
+	resp, err := proxyClient.Do(proxyReq)
 	if err != nil {
+		log.Printf("[submit][ERROR] operator=%s upstream %s não respondeu: %v", operator, targetURL, err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-
-	ctx := context.Background()
-
-	if operator != "" && shouldRecord {
-		podIP := extractPodIP(respBody, target)
-		if podIP != "" {
-			log.Printf("[register] operator=%s → pod %s registrado no redis", operator, podIP)
-			h.store.RecordArtifact(ctx, operator, podIP)
-		}
+	if resp.StatusCode >= 500 {
+		log.Printf("[submit][WARN] operator=%s upstream %s retornou %d", operator, targetURL, resp.StatusCode)
 	}
 
-	// registra hit independente de shouldRecord
-	if operator != "" {
-		h.store.RecordArtifactHit(ctx, operator, target)
-	}
-
+	// copia headers de resposta para o cliente
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
+
+	// TeeReader: transmite a resposta ao cliente em streaming enquanto
+	// captura o body para extração do pod IP (sem double-buffering).
+	var bodyCopy bytes.Buffer
+	if _, err := io.Copy(w, io.TeeReader(resp.Body, &bodyCopy)); err != nil {
+		log.Printf("[submit][WARN] operator=%s stream interrompido para %s: %v", operator, targetURL, err)
+	}
+
+	// registros Redis de forma assíncrona — não bloqueia a resposta ao cliente
+	if operator != "" {
+		go func() {
+			ctx := context.Background()
+			if shouldRecord {
+				podIP := extractPodIP(bodyCopy.Bytes(), target)
+				if podIP != "" {
+					log.Printf("[register] operator=%s → pod %s registrado no redis", operator, podIP)
+					h.store.RecordArtifact(ctx, operator, podIP)
+				} else {
+					log.Printf("[register][WARN] operator=%s não foi possível extrair pod IP da resposta de %s", operator, target)
+				}
+			}
+			h.store.RecordArtifactHit(ctx, operator, target)
+		}()
+	}
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
@@ -133,16 +181,13 @@ func (h *Handler) DeletePod(w http.ResponseWriter, r *http.Request) {
 }
 
 // PodsHealth expõe o snapshot de saúde (memória/CPU) de todos os pods.
-// GET /pods/health
 func (h *Handler) PodsHealth(w http.ResponseWriter, r *http.Request) {
 	infos := h.watcher.GetAllPodsInfo()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(infos)
 }
 
-// ArtifactStats expõe quantas vezes cada pod recebeu requisições para um artefato
-// e o timestamp do último envio.
-// GET /pods/stats?artifact={operator}
+// ArtifactStats expõe contagem de hits e último envio por pod para um artefato.
 func (h *Handler) ArtifactStats(w http.ResponseWriter, r *http.Request) {
 	operator := r.URL.Query().Get("artifact")
 	if operator == "" {

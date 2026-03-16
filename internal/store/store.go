@@ -22,10 +22,23 @@ type Store struct {
 func New(c *cache.Cache) *Store {
 	s := &Store{cache: c}
 
+	sentinelAddr := os.Getenv("REDIS_SENTINEL_ADDR")
+	if sentinelAddr == "" {
+		sentinelAddr = "redis-sentinel.artifact-registry.svc.cluster.local:26379"
+	}
+	masterName := os.Getenv("REDIS_MASTER_NAME")
+	if masterName == "" {
+		masterName = "mymaster"
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	if redisPassword == "" {
+		redisPassword = "redis@HA2024"
+	}
+
 	s.rdb = redis.NewFailoverClient(&redis.FailoverOptions{
-		MasterName:    "mymaster",
-		SentinelAddrs: []string{"redis-sentinel.redis-ha.svc.cluster.local:26379"},
-		Password:      "redis@HA2024",
+		MasterName:    masterName,
+		SentinelAddrs: []string{sentinelAddr},
+		Password:      redisPassword,
 	})
 
 	s.spreadTarget = 0.3

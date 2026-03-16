@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"controller/internal/store"
@@ -93,6 +94,34 @@ type Watcher struct {
 	pods         map[string]PodInfo // podIP → PodInfo
 	client       *http.Client
 	memThreshold float64
+	inFlight     sync.Map // podIP → *int64 (requisições em andamento)
+	warmupFunc   func([]string)
+}
+
+// SetWarmupFunc registra um callback chamado após cada refresh com os IPs dos pods ativos.
+func (w *Watcher) SetWarmupFunc(fn func([]string)) {
+	w.warmupFunc = fn
+}
+
+// IncrementInFlight sinaliza início de uma requisição para o pod.
+func (w *Watcher) IncrementInFlight(podIP string) {
+	v, _ := w.inFlight.LoadOrStore(podIP, new(int64))
+	atomic.AddInt64(v.(*int64), 1)
+}
+
+// DecrementInFlight sinaliza fim de uma requisição para o pod.
+func (w *Watcher) DecrementInFlight(podIP string) {
+	if v, ok := w.inFlight.Load(podIP); ok {
+		atomic.AddInt64(v.(*int64), -1)
+	}
+}
+
+// InFlightCount retorna quantas requisições estão em andamento para o pod.
+func (w *Watcher) InFlightCount(podIP string) int64 {
+	if v, ok := w.inFlight.Load(podIP); ok {
+		return atomic.LoadInt64(v.(*int64))
+	}
+	return 0
 }
 
 func NewWatcher(s *store.Store) *Watcher {
@@ -164,6 +193,14 @@ func (w *Watcher) IsPodHealthy(podIP string) bool {
 		return true // pod desconhecido: assume saudável
 	}
 	return info.MemoryPct() < w.memThreshold
+}
+
+// TotalPods retorna o número de pods ativos sem bater no Redis.
+// O watcher já tem essa informação em memória, atualizada a cada 10s.
+func (w *Watcher) TotalPods() int64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return int64(len(w.pods))
 }
 
 // GetAllPodsInfo retorna snapshot das infos de todos os pods para o endpoint de saúde.
@@ -241,6 +278,10 @@ func (w *Watcher) refresh() {
 
 	log.Printf("[k8s] pods ativos: %v", ips)
 	w.store.SyncPods(context.Background(), ips)
+
+	if w.warmupFunc != nil {
+		w.warmupFunc(ips)
+	}
 }
 
 type podUsage struct{ memUsage, cpuUsage int64 }

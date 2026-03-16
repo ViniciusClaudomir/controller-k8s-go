@@ -21,6 +21,20 @@ func New(s *store.Store, w *k8s.Watcher) *Router {
 	return &Router{store: s, watcher: w}
 }
 
+// leastConnections retorna o pod com menos requisições em andamento.
+// Em caso de empate, escolhe aleatoriamente entre os empatados.
+func leastConnections(candidates []string, w *k8s.Watcher) string {
+	best := candidates[0]
+	bestCount := w.InFlightCount(best)
+	for _, pod := range candidates[1:] {
+		if count := w.InFlightCount(pod); count < bestCount {
+			bestCount = count
+			best = pod
+		}
+	}
+	return best
+}
+
 func (r *Router) SubmitFallback() string {
 	svc := os.Getenv("SUBMIT_SERVICE")
 	if svc == "" {
@@ -30,28 +44,31 @@ func (r *Router) SubmitFallback() string {
 }
 
 // ChooseTarget retorna (targetURL, isCached, shouldRecord).
-//
-// Regras de saúde:
-//   - Pods com memória >= MEM_THRESHOLD são excluídos da seleção normal.
-//   - Se todos os pods do artefato estiverem acima do threshold, roteia para
-//     qualquer pod saudável (sem artefato).
-//   - Último recurso: qualquer pod (mesmo sobrecarregado) ou fallback service.
 func (r *Router) ChooseTarget(ctx context.Context, operator string) (string, bool, bool) {
 	if operator == "" {
-		log.Printf("[route] operator vazio → pod saudável aleatório")
 		if pod := r.watcher.GetRandomPodIP(); pod != "" {
+			log.Printf("[route][WARN] operator ausente → pod aleatório %s", pod)
 			return fmt.Sprintf("http://%s", pod), false, false
 		}
-		return r.SubmitFallback(), false, false
+		fallback := r.SubmitFallback()
+		log.Printf("[route][WARN] operator ausente e sem pods k8s → fallback service %s", fallback)
+		return fallback, false, false
 	}
 
-	total := r.store.GetTotalPods(ctx)
+	total := r.watcher.TotalPods()
+	if total == 0 {
+		log.Printf("[route][WARN] operator=%s watcher sem pods registrados", operator)
+	}
+
 	maxPods := int(math.Ceil(r.store.SpreadTarget() * float64(total)))
 	if maxPods < 1 {
 		maxPods = 1
 	}
 
 	pods, err := r.store.GetPodsByArtifact(ctx, operator)
+	if err != nil {
+		log.Printf("[route][ERROR] operator=%s erro ao buscar artefato no Redis: %v", operator, err)
+	}
 
 	// filtra pods do artefato que estão saudáveis
 	var healthyArtifactPods []string
@@ -61,26 +78,33 @@ func (r *Router) ChooseTarget(ctx context.Context, operator string) (string, boo
 		}
 	}
 
+	if len(pods) > 0 && len(healthyArtifactPods) < len(pods) {
+		log.Printf("[route][WARN] operator=%s %d/%d pods do artefato filtrados por memória alta",
+			operator, len(pods)-len(healthyArtifactPods), len(pods))
+	}
+
 	// sem cache ou todos os pods do artefato acima do threshold
 	if err != nil || len(healthyArtifactPods) == 0 {
 		if len(pods) > 0 && err == nil {
-			log.Printf("[route] operator=%s todos os %d pods do artefato acima do threshold de memória → buscando pod saudável", operator, len(pods))
+			log.Printf("[route][WARN] operator=%s todos os %d pods do artefato estão acima do threshold de memória → buscando pod saudável aleatório",
+				operator, len(pods))
 		}
 
-		// tenta qualquer pod saudável (sem artefato)
 		if pod := r.watcher.GetRandomPodIP(); pod != "" {
-			shouldRecord := err != nil || len(pods) == 0 // só registra artefato se era "sem cache"
-			log.Printf("[route] operator=%s → pod saudável %s (shouldRecord=%v)", operator, pod, shouldRecord)
+			shouldRecord := err != nil || len(pods) == 0
+			log.Printf("[route][WARN] operator=%s sem pods saudáveis para o artefato → pod %s (shouldRecord=%v)", operator, pod, shouldRecord)
 			return fmt.Sprintf("http://%s", pod), false, shouldRecord
 		}
 
 		// último recurso: qualquer pod, mesmo sobrecarregado
 		if pod := r.watcher.GetRandomAnyPodIP(); pod != "" {
-			log.Printf("[route] operator=%s → último recurso (todos sobrecarregados) pod %s", operator, pod)
+			log.Printf("[route][WARN] operator=%s TODOS os pods estão sobrecarregados → enviando para pod %s mesmo acima do threshold", operator, pod)
 			return fmt.Sprintf("http://%s", pod), false, false
 		}
 
-		return r.SubmitFallback(), false, false
+		fallback := r.SubmitFallback()
+		log.Printf("[route][ERROR] operator=%s sem pods disponíveis via k8s → fallback service %s", operator, fallback)
+		return fallback, false, false
 	}
 
 	var ratio float64
@@ -94,18 +118,20 @@ func (r *Router) ChooseTarget(ctx context.Context, operator string) (string, boo
 	randomRate := math.Max(0.1, r.store.SpreadTarget()-ratio)
 
 	if rand.Float64() >= randomRate {
-		chosen := healthyArtifactPods[rand.Intn(len(healthyArtifactPods))]
-		log.Printf("[route] operator=%s cache hit → pod %s (ratio=%.2f healthy=%d maxPods=%d)",
-			operator, chosen, ratio, len(healthyArtifactPods), maxPods)
+		chosen := leastConnections(healthyArtifactPods, r.watcher)
+		log.Printf("[route] operator=%s cache hit → pod %s (ratio=%.2f healthy=%d maxPods=%d inflight=%d)",
+			operator, chosen, ratio, len(healthyArtifactPods), maxPods, r.watcher.InFlightCount(chosen))
 		return fmt.Sprintf("http://%s", chosen), true, false
 	}
 
 	if pod := r.watcher.GetRandomPodIP(); pod != "" {
+		action := map[bool]string{true: "spreading", false: "escape 10%"}[canSpread]
 		log.Printf("[route] operator=%s %s → pod %s (ratio=%.2f healthy=%d maxPods=%d)",
-			operator, map[bool]string{true: "spreading", false: "escape 10%"}[canSpread],
-			pod, ratio, len(healthyArtifactPods), maxPods)
+			operator, action, pod, ratio, len(healthyArtifactPods), maxPods)
 		return fmt.Sprintf("http://%s", pod), false, canSpread
 	}
 
-	return r.SubmitFallback(), false, false
+	fallback := r.SubmitFallback()
+	log.Printf("[route][ERROR] operator=%s sem pods saudáveis para spread → fallback service %s", operator, fallback)
+	return fallback, false, false
 }
